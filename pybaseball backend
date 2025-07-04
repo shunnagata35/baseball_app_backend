@@ -1,0 +1,60 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from pybaseball import statcast_batter, playerid_lookup
+import pandas as pd
+from scipy.stats import pearsonr
+
+app = Flask(__name__)
+CORS(app)
+
+def get_statcast_data(player_name):
+    try:
+        player = playerid_lookup(*player_name.split())  # e.g., "Aaron Judge"
+        player_id = player['key_mlbam'].values[0]
+        data = statcast_batter(player_id, '2024-04-01', '2024-06-30')
+        return data
+    except Exception as e:
+        print(f"Failed to get data for {player_name}: {e}")
+        return pd.DataFrame()
+
+@app.route('/calculate', methods=['POST'])
+def calculate():
+    formula = request.json['formula']
+    players = request.json.get('players', ['Aaron Judge', 'Shohei Ohtani'])
+
+    all_data = []
+
+    for name in players:
+        
+            total = {
+                'Name': name,
+                'HR': 5,
+                'OneB': 9,
+                'TwoB': 2,
+                'ThreeB': 4,
+                'SO': 20,
+                'PA': 40,
+                'launch_speed_avg': 108.2,
+                'launch_angle_avg': 18.0
+            }
+            all_data.append(total)
+
+    df = pd.DataFrame(all_data)
+    print("Available columns:", df.columns)
+
+    try:
+        df['CustomMetric'] = df.eval(formula)
+        correlations = {}
+        for col in ['launch_speed_avg', 'launch_angle_avg']:
+            if df[col].nunique() > 1:
+                correlations[col] = pearsonr(df['CustomMetric'], df[col])[0]
+        top_players = df.sort_values('CustomMetric', ascending=False).to_dict(orient='records')
+        return jsonify({'correlations': correlations, 'top_players': top_players})
+    except Exception as e:
+        print("Formula error:", formula)
+        print("Data columns:", df.columns)
+        print("Error message:", e)
+        return jsonify({'error': f"Invalid formula: {e}"}), 400
+
+if __name__ == '__main__':
+    app.run(debug=True)
