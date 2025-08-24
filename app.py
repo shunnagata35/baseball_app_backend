@@ -11,7 +11,7 @@ CORS(app)
 def calculate():
     formula = request.json['formula']
 
-    # Fetch raw 2025 hitting stats
+    
     raw = statsapi.get('stats', {
         'stats': 'season',
         'group': 'hitting',
@@ -144,8 +144,7 @@ def _attach_team_ids(df_players, season=2025):
     return df_players
 
 def _eval_two_formulas(df, x_formula, y_formula):
-    # Let pandas parse with df.eval (column names must be valid identifiers; they are)
-    # Raise helpful errors if a variable doesn’t exist
+    
     try:
         x_vals = df.eval(x_formula)
     except Exception as e:
@@ -226,7 +225,7 @@ def correlation_teams():
 
     season = int(data.get("season", 2025))
 
-    # Aggregate team totals from player rows
+    #P Aggregate team totals from player rows
     df_players = _collect_player_rows(season)
     df_team = (
         df_players.groupby("Team", as_index=False)[
