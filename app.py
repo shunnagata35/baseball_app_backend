@@ -76,8 +76,8 @@ def index():
         ],
     }, 200
 
-@app.route("/health", methods=["GET"])
-def health():
+@app.get("/api/health")
+def api_health():
     return "ok", 200
 
 # =============================================================================
