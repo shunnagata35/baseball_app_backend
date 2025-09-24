@@ -9,7 +9,22 @@ import pandas as pd
 import numpy as np
 
 app = Flask(__name__)
-CORS(app, origins=["https://68d35cf7507c680008738429--splendorous-malasada-70b433.netlify.app/"])
+
+# --- CORS: allow your Netlify site + local dev ---
+ALLOWED_ORIGINS = [
+    "https://statool1.netlify.app",  # your production Netlify domain (no trailing slash)
+    "http://localhost:5173",         # Vite dev (optional)
+    "http://localhost:3000",         # CRA/Next dev (optional)
+]
+CORS(
+    app,
+    resources={r"/*": {
+        "origins": ALLOWED_ORIGINS,
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }},
+    supports_credentials=False  # set True only if you use cookies/session auth
+)
 
 # =============================================================================
 # Visits counter (SQLite)
@@ -47,9 +62,10 @@ def _db_insert(ip, ua):
 
 _ensure_db()
 
-@app.route("/api/visit", methods=["POST"])
+@app.route("/api/visit", methods=["POST", "OPTIONS"])
 def post_visit():
-    """Counts this request as a new visit and returns the updated total."""
+    if request.method == "OPTIONS":
+        return ("", 204)
     ip = request.headers.get("X-Forwarded-For", request.remote_addr)
     ua = request.headers.get("User-Agent", "")
     _db_insert(ip, ua)
@@ -57,10 +73,9 @@ def post_visit():
 
 @app.route("/api/visits", methods=["GET"])
 def get_visits():
-    """Returns the current total visits (without incrementing)."""
     return jsonify({"total": _db_count()}), 200
 
-# Optional: friendly root + health
+# Friendly root + health
 @app.route("/", methods=["GET"])
 def index():
     return {
@@ -72,7 +87,7 @@ def index():
             "POST /calculate",
             "POST /correlation/players",
             "POST /correlation/teams",
-            "GET  /health",
+            "GET  /api/health",
         ],
     }, 200
 
@@ -92,7 +107,6 @@ def _safe_float(x):
         return 0.0
 
 def _collect_player_rows(season=2025):
-    """Return a DataFrame of all hitters with numeric columns you can use in formulas."""
     raw = statsapi.get('stats', {
         'stats': 'season',
         'group': 'hitting',
@@ -105,7 +119,6 @@ def _collect_player_rows(season=2025):
         stat = p['stat']
         team = p.get('team', {})
         player_info = p.get('player', {})
-
         rows.append({
             "Name": player_info.get("fullName", ""),
             "Team": team.get("name", ""),
@@ -127,7 +140,6 @@ def _collect_player_rows(season=2025):
             "OPS": _safe_float(stat.get("ops", "0")),
             "AVG": _safe_float(stat.get("avg", "0")),
         })
-
     return pd.DataFrame(rows)
 
 def _team_games_map(season=2025):
@@ -135,7 +147,6 @@ def _team_games_map(season=2025):
     return {t["team_id"]: t["w"] + t["l"] for div in standings.values() for t in div["teams"]}
 
 def _attach_team_ids(df_players, season=2025):
-    """Attach team_id to each row (so we can compute qualification by team games)."""
     raw = statsapi.get('stats', {
         'stats': 'season',
         'group': 'hitting',
@@ -179,11 +190,15 @@ def _response_from_xy(df, x_vals, y_vals, label_col):
     return {"points": out, "r": r, "n": len(out)}
 
 # =============================================================================
-# Your existing endpoints
+# API endpoints
 # =============================================================================
-@app.route('/calculate', methods=['POST'])
+@app.route('/calculate', methods=['POST', 'OPTIONS'])
 def calculate():
-    formula = request.json['formula']
+    if request.method == "OPTIONS":
+        return ("", 204)  # CORS preflight
+
+    data = request.get_json(force=True) or {}
+    formula = data.get('formula', '')
 
     raw = statsapi.get('stats', {
         'stats': 'season',
@@ -192,12 +207,9 @@ def calculate():
         'sportIds': 1
     })
 
-    # Get games played per team
     standings = statsapi.standings_data(division="all", season=2025)
-    team_games = {
-        team["team_id"]: team["w"] + team["l"]
-        for div in standings.values() for team in div["teams"]
-    }
+    team_games = {team["team_id"]: team["w"] + team["l"]
+                  for div in standings.values() for team in div["teams"]}
 
     qualified = []
     for player in raw['stats'][0]['splits']:
@@ -205,10 +217,8 @@ def calculate():
         team_id = player['team']['id']
         pa = int(stat.get('plateAppearances', 0))
         team_g = team_games.get(team_id, 162)
-
         if team_g == 0 or pa / team_g < 3.1:
             continue
-
         qualified.append({
             'Name': player['player']['fullName'],
             'Team': player['team']['name'],
@@ -240,12 +250,11 @@ def calculate():
     except Exception as e:
         return jsonify({'error': f"Invalid formula: {e}"}), 400
 
-@app.route('/correlation/players', methods=['POST'])
+@app.route('/correlation/players', methods=['POST', 'OPTIONS'])
 def correlation_players():
-    """
-    Body: { "x_formula": "HR-SO", "y_formula": "R" }
-    Returns: { points: [{x, y, label}], r: number, n: number }
-    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
     data = request.get_json(force=True) or {}
     x_formula = data.get("x_formula", "").strip()
     y_formula = data.get("y_formula", "").strip()
@@ -253,12 +262,9 @@ def correlation_players():
         return jsonify({"error": "x_formula and y_formula are required"}), 400
 
     season = int(data.get("season", 2025))
-
-    # Players base DF
     df = _collect_player_rows(season)
     df = _attach_team_ids(df, season)
 
-    # Get games per team and filter *qualified hitters*
     team_games = _team_games_map(season)
     df["team_g"] = df["team_id"].map(team_games).fillna(0).astype(int)
     df = df[(df["team_g"] > 0) & (df["PA"] / df["team_g"] >= 3.1)]
@@ -268,19 +274,14 @@ def correlation_players():
         return jsonify({"error": err, "available_columns": list(df.columns)}), 400
 
     payload = _response_from_xy(df, x_vals, y_vals, label_col="Name")
-    payload.update({
-        "mode": "players",
-        "x_formula": x_formula,
-        "y_formula": y_formula
-    })
+    payload.update({"mode": "players", "x_formula": x_formula, "y_formula": y_formula})
     return jsonify(payload)
 
-@app.route('/correlation/teams', methods=['POST'])
+@app.route('/correlation/teams', methods=['POST', 'OPTIONS'])
 def correlation_teams():
-    """
-    Body: { "x_formula": "HR-SO", "y_formula": "R" }
-    Team points are team totals (sum of player stats).
-    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
     data = request.get_json(force=True) or {}
     x_formula = data.get("x_formula", "").strip()
     y_formula = data.get("y_formula", "").strip()
@@ -288,15 +289,12 @@ def correlation_teams():
         return jsonify({"error": "x_formula and y_formula are required"}), 400
 
     season = int(data.get("season", 2025))
-
-    # Aggregate team totals from player rows
     df_players = _collect_player_rows(season)
     df_team = (
         df_players.groupby("Team", as_index=False)[
             ["PA","HR","SO","BB","RBI","R","H","Doubles","Triples","SB","CS","GDP","SF","SH"]
         ].sum()
     )
-    # For rate stats like OPS/AVG, we use team means as a simple fallback.
     df_rate = df_players.groupby("Team", as_index=False)[["OPS", "AVG"]].mean()
     df = pd.merge(df_team, df_rate, on="Team", how="left")
 
@@ -305,11 +303,7 @@ def correlation_teams():
         return jsonify({"error": err, "available_columns": list(df.columns)}), 400
 
     payload = _response_from_xy(df, x_vals, y_vals, label_col="Team")
-    payload.update({
-        "mode": "teams",
-        "x_formula": x_formula,
-        "y_formula": y_formula
-    })
+    payload.update({"mode": "teams", "x_formula": x_formula, "y_formula": y_formula})
     return jsonify(payload)
 
 # =============================================================================
