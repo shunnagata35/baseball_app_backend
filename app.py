@@ -1,3 +1,7 @@
+import os
+import sqlite3
+from datetime import datetime
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import statsapi
@@ -5,13 +9,182 @@ import pandas as pd
 import numpy as np
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=[https://68d35cf7507c680008738429--splendorous-malasada-70b433.netlify.app/])
 
+# =============================================================================
+# Visits counter (SQLite)
+# =============================================================================
+VISITS_DB = os.environ.get(
+    "VISITS_DB",
+    os.path.join(os.path.dirname(__file__), "data", "visits.db")
+)
+
+def _ensure_db():
+    os.makedirs(os.path.dirname(VISITS_DB), exist_ok=True)
+    with sqlite3.connect(VISITS_DB) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS visits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                ip TEXT,
+                ua TEXT
+            )
+        """)
+        con.commit()
+
+def _db_count():
+    with sqlite3.connect(VISITS_DB) as con:
+        cur = con.execute("SELECT COUNT(*) FROM visits")
+        return int(cur.fetchone()[0])
+
+def _db_insert(ip, ua):
+    with sqlite3.connect(VISITS_DB) as con:
+        con.execute(
+            "INSERT INTO visits (ts, ip, ua) VALUES (?, ?, ?)",
+            (datetime.utcnow().isoformat(timespec="seconds") + "Z", ip, (ua or "")[:512])
+        )
+        con.commit()
+
+_ensure_db()
+
+@app.route("/api/visit", methods=["POST"])
+def post_visit():
+    """Counts this request as a new visit and returns the updated total."""
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    ua = request.headers.get("User-Agent", "")
+    _db_insert(ip, ua)
+    return jsonify({"total": _db_count()}), 200
+
+@app.route("/api/visits", methods=["GET"])
+def get_visits():
+    """Returns the current total visits (without incrementing)."""
+    return jsonify({"total": _db_count()}), 200
+
+# Optional: friendly root + health
+@app.route("/", methods=["GET"])
+def index():
+    return {
+        "ok": True,
+        "service": "mlb-backend",
+        "routes": [
+            "POST /api/visit    -> increment and return total",
+            "GET  /api/visits   -> return total",
+            "POST /calculate",
+            "POST /correlation/players",
+            "POST /correlation/teams",
+            "GET  /health",
+        ],
+    }, 200
+
+@app.route("/health", methods=["GET"])
+def health():
+    return "ok", 200
+
+# =============================================================================
+# Helpers for baseball endpoints
+# =============================================================================
+def _safe_float(x):
+    try:
+        if x in (None, "", "--"):
+            return 0.0
+        return float(x)
+    except:
+        return 0.0
+
+def _collect_player_rows(season=2025):
+    """Return a DataFrame of all hitters with numeric columns you can use in formulas."""
+    raw = statsapi.get('stats', {
+        'stats': 'season',
+        'group': 'hitting',
+        'season': season,
+        'sportIds': 1
+    })
+    splits = raw['stats'][0]['splits']
+    rows = []
+    for p in splits:
+        stat = p['stat']
+        team = p.get('team', {})
+        player_info = p.get('player', {})
+
+        rows.append({
+            "Name": player_info.get("fullName", ""),
+            "Team": team.get("name", ""),
+            "PA": int(stat.get("plateAppearances", 0)),
+            "HR": int(stat.get("homeRuns", 0)),
+            "SO": int(stat.get("strikeOuts", 0)),
+            "BB": int(stat.get("baseOnBalls", 0)),
+            "RBI": int(stat.get("rbi", 0)),
+            "R": int(stat.get("runs", 0)),
+            "H": int(stat.get("hits", 0)),
+            "Doubles": int(stat.get("doubles", 0)),
+            "Triples": int(stat.get("triples", 0)),
+            "SB": int(stat.get("stolenBases", 0)),
+            "CS": int(stat.get("caughtStealing", 0)),
+            "GDP": int(stat.get("groundIntoDoublePlay", 0)),
+            "SF": int(stat.get("sacFlies", 0)),
+            "SH": int(stat.get("sacBunts", 0)),
+            "HBP": int(stat.get("hitByPitch", 0)),
+            "OPS": _safe_float(stat.get("ops", "0")),
+            "AVG": _safe_float(stat.get("avg", "0")),
+        })
+
+    return pd.DataFrame(rows)
+
+def _team_games_map(season=2025):
+    standings = statsapi.standings_data(division="all", season=season)
+    return {t["team_id"]: t["w"] + t["l"] for div in standings.values() for t in div["teams"]}
+
+def _attach_team_ids(df_players, season=2025):
+    """Attach team_id to each row (so we can compute qualification by team games)."""
+    raw = statsapi.get('stats', {
+        'stats': 'season',
+        'group': 'hitting',
+        'season': season,
+        'sportIds': 1
+    })
+    splits = raw['stats'][0]['splits']
+    m = {}
+    for p in splits:
+        nm = p.get('player', {}).get('fullName', '')
+        tm = p.get('team', {}).get('name', '')
+        tid = p.get('team', {}).get('id', None)
+        if nm and tm and tid is not None:
+            m[(nm, tm)] = tid
+    df_players["team_id"] = df_players.apply(lambda r: m.get((r["Name"], r["Team"])), axis=1)
+    return df_players
+
+def _eval_two_formulas(df, x_formula, y_formula):
+    try:
+        x_vals = df.eval(x_formula)
+    except Exception as e:
+        return None, None, f"X formula error: {e}"
+    try:
+        y_vals = df.eval(y_formula)
+    except Exception as e:
+        return None, None, f"Y formula error: {e}"
+    return x_vals, y_vals, None
+
+def _response_from_xy(df, x_vals, y_vals, label_col):
+    out = []
+    for _, row in df.iterrows():
+        out.append({
+            "x": float(x_vals.loc[row.name]),
+            "y": float(y_vals.loc[row.name]),
+            "label": row[label_col]
+        })
+    if len(out) >= 2:
+        r = float(np.corrcoef([pt["x"] for pt in out], [pt["y"] for pt in out])[0, 1])
+    else:
+        r = None
+    return {"points": out, "r": r, "n": len(out)}
+
+# =============================================================================
+# Your existing endpoints
+# =============================================================================
 @app.route('/calculate', methods=['POST'])
 def calculate():
     formula = request.json['formula']
 
-    
     raw = statsapi.get('stats', {
         'stats': 'season',
         'group': 'hitting',
@@ -39,7 +212,7 @@ def calculate():
         qualified.append({
             'Name': player['player']['fullName'],
             'Team': player['team']['name'],
-           "PA": int(stat.get("plateAppearances", 0)),
+            "PA": int(stat.get("plateAppearances", 0)),
             "HR": int(stat.get("homeRuns", 0)),
             "SO": int(stat.get("strikeOuts", 0)),
             "BB": int(stat.get("baseOnBalls", 0)),
@@ -66,115 +239,6 @@ def calculate():
         return jsonify(top_players)
     except Exception as e:
         return jsonify({'error': f"Invalid formula: {e}"}), 400
-    
-def _safe_float(x):
-    try:
-        if x in (None, "", "--"):
-            return 0.0
-        return float(x)
-    except:
-        return 0.0
-
-def _collect_player_rows(season=2025):
-    """Return a DataFrame of all hitters with numeric columns you can use in formulas."""
-    raw = statsapi.get('stats', {
-        'stats': 'season',
-        'group': 'hitting',
-        'season': season,
-        'sportIds': 1
-    })
-    splits = raw['stats'][0]['splits']
-    rows = []
-    for p in splits:
-        stat = p['stat']
-        team = p.get('team', {})
-        player_info = p.get('player', {})
-
-        rows.append({
-            "Name": player_info.get("fullName", ""),
-            "Team": team.get("name", ""),
-            # identifiers (uppercase, no spaces) so they're easy to use in formulas:
-            "PA": int(stat.get("plateAppearances", 0)),
-            "HR": int(stat.get("homeRuns", 0)),
-            "SO": int(stat.get("strikeOuts", 0)),
-            "BB": int(stat.get("baseOnBalls", 0)),
-            "RBI": int(stat.get("rbi", 0)),
-            "R": int(stat.get("runs", 0)),
-            "H": int(stat.get("hits", 0)),
-            "Doubles": int(stat.get("doubles", 0)),
-            "Triples": int(stat.get("triples", 0)),
-            "SB": int(stat.get("stolenBases", 0)),
-            "CS": int(stat.get("caughtStealing", 0)),
-            "GDP": int(stat.get("groundIntoDoublePlay", 0)),
-            "SF": int(stat.get("sacFlies", 0)),
-            "SH": int(stat.get("sacBunts", 0)),
-            "HBP": int(stat.get("hitByPitch", 0)),
-            "OPS": _safe_float(stat.get("ops", "0")),
-            "AVG": _safe_float(stat.get("avg", "0")),
-            
-        })
-
-    df = pd.DataFrame(rows)
-    return df
-
-def _team_games_map(season=2025):
-    standings = statsapi.standings_data(division="all", season=season)
-    return {t["team_id"]: t["w"] + t["l"] for div in standings.values() for t in div["teams"]}
-
-def _attach_team_ids(df_players, season=2025):
-    """Attach team_id to each row for qualification calc (PA / teamG)."""
-    # statsapi splits already have team id in raw; if not, we infer by refetching
-    # We’ll re-pull the same raw and align on (Name, Team) to get team_id
-    raw = statsapi.get('stats', {
-        'stats': 'season',
-        'group': 'hitting',
-        'season': season,
-        'sportIds': 1
-    })
-    splits = raw['stats'][0]['splits']
-    # build map (Name, Team) -> team_id
-    m = {}
-    for p in splits:
-        nm = p.get('player', {}).get('fullName', '')
-        tm = p.get('team', {}).get('name', '')
-        tid = p.get('team', {}).get('id', None)
-        if nm and tm and tid is not None:
-            m[(nm, tm)] = tid
-    df_players["team_id"] = df_players.apply(lambda r: m.get((r["Name"], r["Team"])), axis=1)
-    return df_players
-
-def _eval_two_formulas(df, x_formula, y_formula):
-    
-    try:
-        x_vals = df.eval(x_formula)
-    except Exception as e:
-        return None, None, f"X formula error: {e}"
-
-    try:
-        y_vals = df.eval(y_formula)
-    except Exception as e:
-        return None, None, f"Y formula error: {e}"
-
-    return x_vals, y_vals, None
-
-def _response_from_xy(df, x_vals, y_vals, label_col):
-    out = []
-    for _, row in df.iterrows():
-        out.append({
-            "x": float(x_vals.loc[row.name]),
-            "y": float(y_vals.loc[row.name]),
-            "label": row[label_col]
-        })
-    # Pearson r
-    if len(out) >= 2:
-        r = float(np.corrcoef([pt["x"] for pt in out], [pt["y"] for pt in out])[0, 1])
-    else:
-        r = None
-    return {
-        "points": out,
-        "r": r,
-        "n": len(out)
-    }
 
 @app.route('/correlation/players', methods=['POST'])
 def correlation_players():
@@ -225,14 +289,14 @@ def correlation_teams():
 
     season = int(data.get("season", 2025))
 
-    #P Aggregate team totals from player rows
+    # Aggregate team totals from player rows
     df_players = _collect_player_rows(season)
     df_team = (
         df_players.groupby("Team", as_index=False)[
             ["PA","HR","SO","BB","RBI","R","H","Doubles","Triples","SB","CS","GDP","SF","SH"]
         ].sum()
     )
-    # For rate stats like OPS/AVG, you could compute weighted versions; here we use team-level means as a fallback
+    # For rate stats like OPS/AVG, we use team means as a simple fallback.
     df_rate = df_players.groupby("Team", as_index=False)[["OPS", "AVG"]].mean()
     df = pd.merge(df_team, df_rate, on="Team", how="left")
 
@@ -248,5 +312,9 @@ def correlation_teams():
     })
     return jsonify(payload)
 
+# =============================================================================
+# Entrypoint
+# =============================================================================
 if __name__ == '__main__':
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=True)
