@@ -9,7 +9,7 @@ import pandas as pd
 import numpy as np
 
 app = Flask(__name__)
-CORS(app, origins=[https://68d35cf7507c680008738429--splendorous-malasada-70b433.netlify.app/])
+CORS(app, origins=["https://68d35cf7507c680008738429--splendorous-malasada-70b433.netlify.app/"])
 
 # =============================================================================
 # Visits counter (SQLite)
